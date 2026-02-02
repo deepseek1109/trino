@@ -1,0 +1,110 @@
+name: Feature Branch Maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      feature_branch:
+        description: 'Feature branch to rebase onto master'
+        required: true
+        type: string
+      push_after_rebase:
+        description: 'Push the rebased branch to origin'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  rebase-feature:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.feature_branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/trinodb/trino.git
+          git fetch upstream
+          git fetch origin
+      
+      - name: Rebase feature branch onto master
+        id: rebase
+        run: |
+          # First update master from origin
+          git checkout master
+          git pull origin master
+          
+          # Checkout feature branch and rebase
+          git checkout ${{ inputs.feature_branch }}
+          
+          # Check if rebase is needed
+          BASE_COMMIT=$(git merge-base HEAD master)
+          MASTER_COMMIT=$(git rev-parse master)
+          
+          if [ "$BASE_COMMIT" = "$MASTER_COMMIT" ]; then
+            echo "✅ Feature branch is already up to date with master"
+            echo "rebase_needed=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 Rebasing feature branch onto master..."
+            git rebase master
+            echo "rebase_needed=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Push rebased branch
+        if: steps.rebase.outputs.rebase_needed == 'true' && inputs.push_after_rebase == true
+        run: |
+          git push origin ${{ inputs.feature_branch }} --force-with-lease
+      
+      - name: Create success comment
+        if: success() && steps.rebase.outputs.rebase_needed == 'true' && inputs.push_after_rebase == true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ inputs.feature_branch }}';
+            const message = `✅ Successfully rebased \`${branch}\` onto master and pushed to origin.`;
+            
+            github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: message
+            });
+      
+      - name: Create issue on conflict
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const branch = '${{ inputs.feature_branch }}';
+            const title = `⚠️ Feature branch \`${branch}\` rebase failed`;
+            const body = `Automatic rebase of \`${branch}\` onto master failed due to conflicts.
+            
+            **Steps to resolve manually:**
+            \`\`\`bash
+            git fetch origin
+            git checkout ${branch}
+            git rebase origin/master
+            # Resolve conflicts
+            git push origin ${branch} --force-with-lease
+            \`\`\`
+            
+            **Time:** ${new Date().toISOString()}`;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['feature-branch', 'rebase-failed']
+            });

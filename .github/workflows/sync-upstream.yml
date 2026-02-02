@@ -1,0 +1,101 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC (low traffic time)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+    inputs:
+      branch:
+        description: 'Branch to sync (default: master)'
+        required: false
+        default: 'master'
+
+env:
+  UPSTREAM_REPO: https://github.com/trinodb/trino.git
+  TARGET_BRANCH: ${{ github.event.inputs.branch || 'master' }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream ${{ env.UPSTREAM_REPO }}
+          git fetch upstream
+      
+      - name: Check if sync is needed
+        id: check
+        run: |
+          LOCAL_COMMIT=$(git rev-parse HEAD)
+          UPSTREAM_COMMIT=$(git rev-parse upstream/${{ env.TARGET_BRANCH }})
+          
+          if [ "$LOCAL_COMMIT" = "$UPSTREAM_COMMIT" ]; then
+            echo "No new commits to sync"
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits found, need to sync"
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Rebase onto upstream
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          git rebase upstream/${{ env.TARGET_BRANCH }}
+      
+      - name: Push rebased branch
+        if: steps.check.outputs.needs_sync == 'true'
+        run: |
+          git push origin ${{ env.TARGET_BRANCH }} --force-with-lease
+      
+      - name: Create issue on conflict
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '⚠️ Upstream sync failed - Manual rebase required';
+            const body = `Automatic sync with upstream failed due to conflicts.
+            
+            **Action required:** Manual rebase needed
+            
+            **Steps to resolve:**
+            1. Clone your fork locally
+            2. Run: \`git fetch upstream\`
+            3. Run: \`git rebase upstream/${process.env.TARGET_BRANCH}\`
+            4. Resolve any conflicts
+            5. Run: \`git push origin ${process.env.TARGET_BRANCH} --force-with-lease\`
+            
+            **Last attempted sync:** ${new Date().toISOString()}
+            **Target branch:** ${process.env.TARGET_BRANCH}`;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['upstream-sync', 'help wanted']
+            });
+      
+      - name: Log success
+        if: steps.check.outputs.needs_sync == 'true' && success()
+        run: |
+          echo "✅ Successfully synced with upstream"
+          echo "   Branch: ${{ env.TARGET_BRANCH }}"
+          echo "   Upstream commit: ${{ steps.check.outputs.upstream_commit }}"
